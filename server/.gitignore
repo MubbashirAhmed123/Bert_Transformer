@@ -1,0 +1,15 @@
+# Python bytecode
+__pycache__/
+*.py[cod]
+*.pyo
+
+# Virtual environment
+.venv/
+venv/
+
+# Trained model — run `python bert_transformer.py` once before starting the server
+saved_model/
+
+# Local env
+.env
+.env.local

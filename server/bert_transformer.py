@@ -1,15 +1,13 @@
-
-
-
 import torch
 from torch.utils.data import Dataset, DataLoader
 from transformers import BertTokenizer, BertForSequenceClassification
 from torch.optim import AdamW
 from sklearn.model_selection import train_test_split
-import numpy as np
 import pandas as pd
+from pathlib import Path
 
-
+MODEL_DIR = Path(__file__).parent / "saved_model"
+BASE_MODEL = "bert-base-uncased"
 
 intents = [
     "greeting",
@@ -17,11 +15,10 @@ intents = [
     "refund_request",
     "order_status",
     "payment_issue",
-    "complaint"
+    "complaint",
 ]
 
 data = [
-
 ("hello",0),("hi",0),("hey",0),("good morning",0),("good evening",0),
 ("good afternoon",0),("hi there",0),("hello there",0),("hey buddy",0),
 ("hey bro",0),("hi team",0),("greetings",0),("yo",0),("what's up",0),
@@ -139,28 +136,18 @@ data = [
 ("angry about service",5),("bad support team",5),
 ]
 
-df = pd.DataFrame(data, columns=["text", "label"])
+_tokenizer = None
+_model = None
+_device = None
 
-texts = df["text"].tolist()
-labels = df["label"].tolist()
-
-
-
-train_texts, val_texts, train_labels, val_labels = train_test_split(
-    texts, labels, test_size=0.2, random_state=42
-)
-
-
-
-tokenizer = BertTokenizer.from_pretrained("bert-base-uncased")
 
 class IntentDataset(Dataset):
-    def __init__(self, texts, labels):
+    def __init__(self, texts, labels, tokenizer):
         self.encodings = tokenizer(
             texts,
             truncation=True,
             padding=True,
-            max_length=32
+            max_length=32,
         )
         self.labels = labels
 
@@ -172,88 +159,114 @@ class IntentDataset(Dataset):
     def __len__(self):
         return len(self.labels)
 
-train_dataset = IntentDataset(train_texts, train_labels)
-val_dataset = IntentDataset(val_texts, val_labels)
 
-train_loader = DataLoader(train_dataset, batch_size=4, shuffle=True)
-val_loader = DataLoader(val_dataset, batch_size=4)
+def train_and_save(epochs=5):
+    df = pd.DataFrame(data, columns=["text", "label"])
+    texts = df["text"].tolist()
+    labels = df["label"].tolist()
+
+    train_texts, _, train_labels, _ = train_test_split(
+        texts, labels, test_size=0.2, random_state=42
+    )
+
+    tokenizer = BertTokenizer.from_pretrained(BASE_MODEL)
+    train_dataset = IntentDataset(train_texts, train_labels, tokenizer)
+    train_loader = DataLoader(train_dataset, batch_size=4, shuffle=True)
+
+    model = BertForSequenceClassification.from_pretrained(
+        BASE_MODEL,
+        num_labels=len(intents),
+    )
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print("Using device:", device)
+    model.to(device)
+
+    optimizer = AdamW(model.parameters(), lr=2e-5)
+
+    for epoch in range(epochs):
+        model.train()
+        total_loss = 0
+
+        for batch in train_loader:
+            batch = {k: v.to(device) for k, v in batch.items()}
+            outputs = model(**batch)
+            loss = outputs.loss
+
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+
+            total_loss += loss.item()
+
+        print(f"Epoch {epoch + 1}, Loss: {total_loss:.4f}")
+
+    MODEL_DIR.mkdir(parents=True, exist_ok=True)
+    model.save_pretrained(MODEL_DIR)
+    tokenizer.save_pretrained(MODEL_DIR)
+    print(f"Training complete. Model saved to {MODEL_DIR}")
 
 
-model = BertForSequenceClassification.from_pretrained(
-    "bert-base-uncased",
-    num_labels=len(intents)
-)
+def _load_model():
+    global _tokenizer, _model, _device
 
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-print("Using device:", device)
-model.to(device)
+    if _model is not None:
+        return
 
+    if not MODEL_DIR.exists():
+        print("No saved model found — training once (this takes a few minutes)...")
+        train_and_save()
 
-optimizer = AdamW(model.parameters(), lr=2e-5)
-
-
-
-epochs = 5
-
-for epoch in range(epochs):
-    model.train()
-    total_loss = 0
-
-    for batch in train_loader:
-        batch = {k: v.to(device) for k, v in batch.items()}
-
-        outputs = model(**batch)
-        loss = outputs.loss
-
-        optimizer.zero_grad()
-        loss.backward()
-        optimizer.step()
-
-        total_loss += loss.item()
-
-    print(f"Epoch {epoch+1}, Loss: {total_loss:.4f}")
-
-print("Training Complete ✅")
-
+    print("Loading saved model...")
+    _device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    _tokenizer = BertTokenizer.from_pretrained(MODEL_DIR)
+    _model = BertForSequenceClassification.from_pretrained(MODEL_DIR)
+    _model.to(_device)
+    _model.eval()
+    print("Model ready.")
 
 
 def predict(text):
-    model.eval()
+    _load_model()
 
-    inputs = tokenizer(
+    inputs = _tokenizer(
         text,
         return_tensors="pt",
         truncation=True,
         padding=True,
-        max_length=32
+        max_length=32,
     )
-
-    inputs = {k: v.to(device) for k, v in inputs.items()}
+    inputs = {k: v.to(_device) for k, v in inputs.items()}
 
     with torch.no_grad():
-        outputs = model(**inputs)
+        outputs = _model(**inputs)
 
-    logits = outputs.logits
-    predicted_class = torch.argmax(logits, dim=1).item()
+    probs = torch.softmax(outputs.logits, dim=1)
+    predicted_class = torch.argmax(probs, dim=1).item()
+    confidence = probs[0, predicted_class].item()
 
-    return intents[predicted_class]
+    return {
+        "intent": intents[predicted_class],
+        "confidence": round(confidence, 4),
+    }
 
 
+if __name__ == "__main__":
+    train_and_save()
 
+    tests = [
+        "hello",
+        "i need to reset my password",
+        "where is my package",
+        "payment not working",
+        "i want my money back",
+        "i am very unhappy with the service",
+        "this is terrible",
+        "very bad service",
+    ]
 
-tests = [
-    "hello",
-    "i need to reset my password",
-    "where is my package",
-    "payment not working",
-    "i want my money back",
-    "i am very unhappy with the service",
-    "this is terrible",
-    "very bad service"
-
-]
-
-for t in tests:
-    print("Text:", t)
-    print("Predicted:", predict(t))
-    print("------")
+    for t in tests:
+        result = predict(t)
+        print("Text:", t)
+        print("Predicted:", result["intent"], f"({result['confidence']:.1%})")
+        print("------")
